@@ -1,0 +1,916 @@
+#include "main.h"
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+
+using namespace pros;
+
+#define _USE_MATH_DEFINES
+
+// ------------------------------------------------------------
+// Drive configuration
+// ------------------------------------------------------------
+Motor RF(12, E_MOTOR_GEARSET_06, false, E_MOTOR_ENCODER_DEGREES);
+Motor LF(19, E_MOTOR_GEARSET_06, true,  E_MOTOR_ENCODER_DEGREES);
+Motor RM(11, E_MOTOR_GEARSET_06, false, E_MOTOR_ENCODER_DEGREES);
+Motor LM(15, E_MOTOR_GEARSET_06, true,  E_MOTOR_ENCODER_DEGREES);
+Motor RB(1,  E_MOTOR_GEARSET_06, false, E_MOTOR_ENCODER_DEGREES);
+Motor LB(10, E_MOTOR_GEARSET_06, true,  E_MOTOR_ENCODER_DEGREES);
+Motor Intake(9, E_MOTOR_GEARSET_18, true, E_MOTOR_ENCODER_DEGREES);
+
+Controller master(E_CONTROLLER_MASTER);
+
+// ------------------------------------------------------------
+// Tracking/odometry sensors
+// ------------------------------------------------------------
+Rotation forward_tracker(13);
+Rotation strafe_tracker(14);
+Imu imu(16);
+
+// ------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------
+double clampd(double value, double lo, double hi) {
+    if (value < lo) return lo;
+    if (value > hi) return hi;
+    return value;
+}
+
+double normalize_deg(double deg) {
+    while (deg > 180.0) deg -= 360.0;
+    while (deg < -180.0) deg += 360.0;
+    return deg;
+}
+
+void setDriveLeft(int speed) {
+    LF = speed;
+    LM = speed;
+    LB = speed;
+}
+
+void setDriveRight(int speed) {
+    RF = speed;
+    RM = speed;
+    RB = speed;
+}
+
+void stopDrive() {
+    setDriveLeft(0);
+    setDriveRight(0);
+}
+
+// NOTE: In PROS, the conventional names are `E_MOTOR_DIR_FORWARD` and `E_MOTOR_DIR_REVERSE`.
+// This enum keeps the original code semantics while avoiding VEX-only API names.
+enum class DriveDir { FORWARD, REVERSE };
+
+// ------------------------------------------------------------
+// Odom constants and state
+// ------------------------------------------------------------
+const double WHEEL_DIAMETER_IN = 2.0;
+const double TICKS_PER_REV = 360.0;
+const double DIST_PER_TICK = (M_PI * WHEEL_DIAMETER_IN) / TICKS_PER_REV;
+
+const double FORWARD_OFFSET_IN = 0.0;
+const double STRAFE_OFFSET_IN = 0.0;
+
+const bool USE_HEADING_FUSION = true;
+const double HEADING_FUSION_IMU_WEIGHT = 0.9;
+const double DRIVE_WHEEL_DIAMETER_IN = 2.75;
+const double ROBOT_TRACK_WIDTH_IN = 15.0;
+
+double prev_right_wheel_deg = 0.0;
+double prev_left_wheel_deg = 0.0;
+double prev_imu_heading_rad = 0.0;
+
+double global_x = 0.0;
+double global_y = 0.0;
+double global_heading_rad = 0.0;
+
+double prev_forward_ticks = 0.0;
+double prev_strafe_ticks = 0.0;
+double prev_heading_rad = 0.0;
+
+enum StartPosition {
+    RED_LEFT,
+    RED_BOTTOM,
+    BLUE_RIGHT,
+    BLUE_TOP
+};
+
+StartPosition startPos = RED_LEFT;
+
+enum AutonStrategy {
+    SIDEA,
+    SIDEB,
+    SIDEC
+};
+
+AutonStrategy autonStrategy = SIDEA;
+
+void get_start_pose(StartPosition pos, double &x, double &y, double &heading_deg) {
+    switch (pos) {
+        case RED_LEFT:   x = -72.0; y =   0.0; heading_deg = -90.0; break;
+        case RED_BOTTOM: x =   0.0; y = -72.0; heading_deg =   0.0; break;
+        case BLUE_RIGHT: x =  72.0; y =   0.0; heading_deg =  90.0; break;
+        case BLUE_TOP:   x =   0.0; y =  72.0; heading_deg = 180.0; break;
+    }
+}
+
+void odom_init(double start_x, double start_y, double start_heading_rad) {
+    global_x = start_x;
+    global_y = start_y;
+    global_heading_rad = start_heading_rad;
+
+    forward_tracker.reset_position();
+    strafe_tracker.reset_position();
+
+    prev_forward_ticks = 0.0;
+    prev_strafe_ticks = 0.0;
+    prev_heading_rad = start_heading_rad;
+
+    prev_right_wheel_deg = (RF.get_position() + RM.get_position() + RB.get_position()) / 3.0;
+    prev_left_wheel_deg = (LF.get_position() + LM.get_position() + LB.get_position()) / 3.0;
+    prev_imu_heading_rad = imu.get_yaw() * (M_PI / 180.0);
+}
+
+void odom_update() {
+    double current_forward_ticks = forward_tracker.get_position();
+    double current_strafe_ticks = strafe_tracker.get_position();
+    double imu_heading_rad = imu.get_yaw() * (M_PI / 180.0);
+
+    double delta_forward_ticks = current_forward_ticks - prev_forward_ticks;
+    double delta_strafe_ticks = current_strafe_ticks - prev_strafe_ticks;
+
+    double forward_dist = delta_forward_ticks * DIST_PER_TICK;
+    double strafe_dist = delta_strafe_ticks * DIST_PER_TICK;
+
+    double delta_heading_imu = normalize_deg((imu_heading_rad - prev_imu_heading_rad) * (180.0 / M_PI)) * (M_PI / 180.0);
+
+    double delta_heading;
+    if (USE_HEADING_FUSION) {
+        double current_right_deg = (RF.get_position() + RM.get_position() + RB.get_position()) / 3.0;
+        double current_left_deg = (LF.get_position() + LM.get_position() + LB.get_position()) / 3.0;
+        double delta_right_dist = (current_right_deg - prev_right_wheel_deg) * (M_PI * DRIVE_WHEEL_DIAMETER_IN / 360.0);
+        double delta_left_dist = (current_left_deg - prev_left_wheel_deg) * (M_PI * DRIVE_WHEEL_DIAMETER_IN / 360.0);
+        double delta_heading_wheels = (delta_right_dist - delta_left_dist) / ROBOT_TRACK_WIDTH_IN;
+
+        delta_heading = HEADING_FUSION_IMU_WEIGHT * delta_heading_imu
+                      + (1.0 - HEADING_FUSION_IMU_WEIGHT) * delta_heading_wheels;
+
+        prev_right_wheel_deg = current_right_deg;
+        prev_left_wheel_deg = current_left_deg;
+    } else {
+        delta_heading = delta_heading_imu;
+    }
+    prev_imu_heading_rad = imu_heading_rad;
+
+    double local_y = forward_dist - (FORWARD_OFFSET_IN * delta_heading);
+    double local_x = strafe_dist - (STRAFE_OFFSET_IN * delta_heading);
+
+    double avg_heading = prev_heading_rad + (delta_heading / 2.0);
+
+    double delta_global_x = local_x * cos(avg_heading) - local_y * sin(avg_heading);
+    double delta_global_y = local_x * sin(avg_heading) + local_y * cos(avg_heading);
+
+    global_x += delta_global_x;
+    global_y += delta_global_y;
+    global_heading_rad += delta_heading;
+
+    prev_forward_ticks = current_forward_ticks;
+    prev_strafe_ticks = current_strafe_ticks;
+    prev_heading_rad = global_heading_rad;
+}
+
+int odom_task_fn(void*) {
+    double start_x, start_y, start_heading_deg;
+    get_start_pose(startPos, start_x, start_y, start_heading_deg);
+    odom_init(start_x, start_y, start_heading_deg * (M_PI / 180.0));
+
+    while (true) {
+        odom_update();
+        lcd::print(1, "X: %.2f", global_x);
+        lcd::print(2, "Y: %.2f", global_y);
+        lcd::print(3, "H: %.2f deg", global_heading_rad * (180.0 / M_PI));
+        delay(10);
+    }
+    return 0;
+}
+
+// ------------------------------------------------------------
+// PID controller
+// ------------------------------------------------------------
+struct PID {
+    double kP, kI, kD;
+    double integral_limit = 0;
+    double error = 0, prev_error = 0, integral = 0;
+
+    PID(double p, double i, double d, double i_limit = 0)
+        : kP(p), kI(i), kD(d), integral_limit(i_limit) {}
+
+    double compute(double target, double current) {
+        error = target - current;
+        integral += error;
+
+        if (integral_limit != 0) {
+            if (integral > integral_limit) integral = integral_limit;
+            if (integral < -integral_limit) integral = -integral_limit;
+        }
+        if ((error > 0 && prev_error < 0) || (error < 0 && prev_error > 0)) {
+            integral = 0;
+        }
+
+        double derivative = error - prev_error;
+        prev_error = error;
+        return (kP * error) + (kI * integral) + (kD * derivative);
+    }
+
+    void reset() { error = 0; prev_error = 0; integral = 0; }
+};
+
+PID turnPID(0.6, 0.0, 0.05, 20);
+PID drivePID(2.0, 0.0, 0.1, 20);
+
+enum TurnDirection { TURN_SHORTEST, TURN_CW, TURN_CCW };
+
+void turn_to_heading(double target_heading_deg, TurnDirection dir = TURN_SHORTEST, double timeout_ms = 3000) {
+    turnPID.reset();
+    uint32_t start = millis();
+
+    while (millis() - start < timeout_ms) {
+        double current_deg = global_heading_rad * (180.0 / M_PI);
+        double raw_error = target_heading_deg - current_deg;
+        double error_deg;
+
+        if (dir == TURN_CW) {
+            error_deg = raw_error;
+            while (error_deg < 0) error_deg += 360.0;
+        } else if (dir == TURN_CCW) {
+            error_deg = raw_error;
+            while (error_deg > 0) error_deg -= 360.0;
+        } else {
+            error_deg = normalize_deg(raw_error);
+        }
+
+        double output = turnPID.compute(error_deg, 0);
+        output = clampd(output, -100.0, 100.0);
+
+        setDriveLeft(-output);
+        setDriveRight(output);
+
+        if (fabs(normalize_deg(raw_error)) < 1.0) break;
+        delay(10);
+    }
+    stopDrive();
+}
+
+enum SwingSide { SWING_LEFT, SWING_RIGHT };
+
+void swing_to_heading(double target_heading_deg, SwingSide stillSide, TurnDirection dir = TURN_SHORTEST, double timeout_ms = 3000) {
+    turnPID.reset();
+    uint32_t start = millis();
+
+    while (millis() - start < timeout_ms) {
+        double current_deg = global_heading_rad * (180.0 / M_PI);
+        double raw_error = target_heading_deg - current_deg;
+        double error_deg;
+
+        if (dir == TURN_CW) {
+            error_deg = raw_error;
+            while (error_deg < 0) error_deg += 360.0;
+        } else if (dir == TURN_CCW) {
+            error_deg = raw_error;
+            while (error_deg > 0) error_deg -= 360.0;
+        } else {
+            error_deg = normalize_deg(raw_error);
+        }
+
+        double output = turnPID.compute(error_deg, 0);
+        output = clampd(output, -100.0, 100.0);
+
+        if (stillSide == SWING_LEFT) {
+            setDriveLeft(0);
+            setDriveRight(output);
+        } else {
+            setDriveRight(0);
+            setDriveLeft(-output);
+        }
+
+        if (fabs(normalize_deg(raw_error)) < 1.0) break;
+        delay(10);
+    }
+    stopDrive();
+}
+
+void Swing_To_Heading(double target_deg, SwingSide stillSide, TurnDirection dir = TURN_SHORTEST, double timeout_ms = 3000) {
+    swing_to_heading(target_deg, stillSide, dir, timeout_ms);
+}
+
+void drive_to_point(double target_x, double target_y, double timeout_ms = 4000) {
+    drivePID.reset();
+    uint32_t start = millis();
+
+    while (millis() - start < timeout_ms) {
+        double dx = target_x - global_x;
+        double dy = target_y - global_y;
+        double dist_error = sqrt(dx * dx + dy * dy);
+
+        double target_heading_deg = atan2(dx, dy) * (180.0 / M_PI);
+        double current_deg = global_heading_rad * (180.0 / M_PI);
+        double heading_error_deg = normalize_deg(target_heading_deg - current_deg);
+
+        double drive_output = drivePID.compute(dist_error, 0);
+        drive_output = clampd(drive_output, -100.0, 100.0);
+        double turn_output = heading_error_deg * 0.3;
+        turn_output = clampd(turn_output, -30.0, 30.0);
+
+        setDriveRight(drive_output - turn_output);
+        setDriveLeft(drive_output + turn_output);
+
+        if (dist_error < 1.0) break;
+        delay(10);
+    }
+    stopDrive();
+}
+
+void RS_Drive(DriveDir dir, int degrees, int speed) {
+    int target = (dir == DriveDir::REVERSE) ? -degrees : degrees;
+    RF.move_relative(target, speed);
+    RM.move_relative(target, speed);
+    RB.move_relative(target, speed);
+    while (RF.get_target_position() != RF.get_position() || RM.get_target_position() != RM.get_position() || RB.get_target_position() != RB.get_position()) {
+        delay(10);
+    }
+}
+
+void LS_Drive(DriveDir dir, int degrees, int speed) {
+    int target = (dir == DriveDir::REVERSE) ? -degrees : degrees;
+    LF.move_relative(target, speed);
+    LM.move_relative(target, speed);
+    LB.move_relative(target, speed);
+    while (LF.get_target_position() != LF.get_position() || LM.get_target_position() != LM.get_position() || LB.get_target_position() != LB.get_position()) {
+        delay(10);
+    }
+}
+
+void Drive_To_Point(double x, double y, double timeout_ms = 4000) { drive_to_point(x, y, timeout_ms); }
+void Turn_To_Heading(double target_deg, TurnDirection dir = TURN_SHORTEST, double timeout_ms = 3000) { turn_to_heading(target_deg, dir, timeout_ms); }
+
+void IntakeSpin(int speed_pct, double duration_ms) {
+    Intake = speed_pct;
+    delay(static_cast<int>(duration_ms));
+    Intake = 0;
+}
+
+// ------------------------------------------------------------
+// Lift logic
+// ------------------------------------------------------------
+motor LiftL(17, E_MOTOR_GEARSET_36, false, E_MOTOR_ENCODER_DEGREES);
+motor LiftR(18, E_MOTOR_GEARSET_36, true,  E_MOTOR_ENCODER_DEGREES);
+
+const double LIFT_DOWN_DEG = 0.0;
+const double LIFT_MID_DEG = 400.0;
+const double LIFT_UP_DEG = 850.0;
+
+double liftTargetDeg = LIFT_DOWN_DEG;
+
+enum LiftState { LIFT_STATE_DOWN, LIFT_STATE_MID, LIFT_STATE_UP };
+LiftState liftState = LIFT_STATE_DOWN;
+
+PID liftPID(0.8, 0.05, 0.1, 15);
+
+void lift_set_target(double target_deg) {
+    liftTargetDeg = target_deg;
+}
+
+void Lift_Move_To(double target_deg, double timeout_ms = 3000) {
+    lift_set_target(target_deg);
+    uint32_t start = millis();
+    while (millis() - start < timeout_ms) {
+        if (fabs((LiftL.get_position() + LiftR.get_position()) / 2.0 - target_deg) < 10.0) break;
+        delay(10);
+    }
+}
+
+int lift_task_fn(void*) {
+    LiftL.set_brake_mode(E_MOTOR_BRAKE_HOLD);
+    LiftR.set_brake_mode(E_MOTOR_BRAKE_HOLD);
+    while (true) {
+        double current_deg = (LiftL.get_position() + LiftR.get_position()) / 2.0;
+        double output = liftPID.compute(liftTargetDeg, current_deg);
+        output = clampd(output, -100.0, 100.0);
+
+        LiftL = output;
+        LiftR = output;
+        delay(10);
+    }
+    return 0;
+}
+
+// ------------------------------------------------------------
+// Toggle locations
+// ------------------------------------------------------------
+const double FIELD_HALF_IN = 72.0;
+const double TOGGLE_STANDOFF_IN = 6.0;
+
+const double TOGGLE_TOP_X = 0.0, TOGGLE_TOP_Y = (FIELD_HALF_IN - TOGGLE_STANDOFF_IN);
+const double TOGGLE_BOTTOM_X = 0.0, TOGGLE_BOTTOM_Y = -(FIELD_HALF_IN - TOGGLE_STANDOFF_IN);
+const double TOGGLE_LEFT_X = -(FIELD_HALF_IN - TOGGLE_STANDOFF_IN), TOGGLE_LEFT_Y = 0.0;
+const double TOGGLE_RIGHT_X = (FIELD_HALF_IN - TOGGLE_STANDOFF_IN), TOGGLE_RIGHT_Y = 0.0;
+
+void touch_toggle_top() { drive_to_point(TOGGLE_TOP_X, TOGGLE_TOP_Y); turn_to_heading(0.0); }
+void touch_toggle_bottom() { drive_to_point(TOGGLE_BOTTOM_X, TOGGLE_BOTTOM_Y); turn_to_heading(180.0); }
+void touch_toggle_left() { drive_to_point(TOGGLE_LEFT_X, TOGGLE_LEFT_Y); turn_to_heading(90.0); }
+void touch_toggle_right() { drive_to_point(TOGGLE_RIGHT_X, TOGGLE_RIGHT_Y); turn_to_heading(-90.0); }
+
+// ------------------------------------------------------------
+// Ramsete trajectory controller
+// ------------------------------------------------------------
+const double MAX_VELOCITY_IN_PER_SEC = 40.0;
+const double RAMSETE_CRUISE_VEL_IN_PER_SEC = 20.0;
+const double RAMSETE_B = 2.0;
+const double RAMSETE_ZETA = 0.7;
+
+double sinc(double x) {
+    if (fabs(x) < 1e-6) return 1.0;
+    return sin(x) / x;
+}
+
+void ramsete_drive_to_point(double target_x, double target_y, double timeout_ms = 4000) {
+    double start_x = global_x, start_y = global_y;
+    double path_dx = target_x - start_x, path_dy = target_y - start_y;
+    double total_dist = sqrt(path_dx * path_dx + path_dy * path_dy);
+    double path_heading_rad = atan2(path_dx, path_dy);
+    double total_time_sec = total_dist / RAMSETE_CRUISE_VEL_IN_PER_SEC;
+
+    uint32_t start_ms = millis();
+    while (millis() - start_ms < timeout_ms) {
+        double t = (millis() - start_ms) / 1000.0;
+        double frac = clampd(t / total_time_sec, 0.0, 1.0);
+
+        double x_d = start_x + path_dx * frac;
+        double y_d = start_y + path_dy * frac;
+        double v_d = (frac < 1.0) ? RAMSETE_CRUISE_VEL_IN_PER_SEC : 0.0;
+        double omega_d = 0.0;
+
+        double theta = global_heading_rad;
+        double global_dx = x_d - global_x;
+        double global_dy = y_d - global_y;
+
+        double e_right = cos(theta) * global_dx + sin(theta) * global_dy;
+        double e_forward = -sin(theta) * global_dx + cos(theta) * global_dy;
+        double e_theta = normalize_deg((path_heading_rad - theta) * (180.0 / M_PI)) * (M_PI / 180.0);
+
+        double k = 2.0 * RAMSETE_ZETA * sqrt(omega_d * omega_d + RAMSETE_B * v_d * v_d);
+        double v = v_d * cos(e_theta) + k * e_forward;
+        double omega = omega_d + k * e_theta + RAMSETE_B * v_d * sinc(e_theta) * e_right;
+
+        double v_right = v + omega * (ROBOT_TRACK_WIDTH_IN / 2.0);
+        double v_left = v - omega * (ROBOT_TRACK_WIDTH_IN / 2.0);
+
+        double right_pct = clampd((v_right / MAX_VELOCITY_IN_PER_SEC) * 100.0, -100.0, 100.0);
+        double left_pct = clampd((v_left / MAX_VELOCITY_IN_PER_SEC) * 100.0, -100.0, 100.0);
+
+        setDriveRight(right_pct);
+        setDriveLeft(left_pct);
+
+        double remaining_dist = sqrt(e_forward * e_forward + e_right * e_right);
+        if (frac >= 1.0 && remaining_dist < 1.0) break;
+        delay(10);
+    }
+    stopDrive();
+}
+
+struct RamsetePoint { double x; double y; };
+void Ramsete_Follow_Path(RamsetePoint* waypoints, int numWaypoints, double timeout_ms);
+
+void Ramsete_Drive_To_Point(double x, double y, double timeout_ms = 8000) {
+    RamsetePoint single[] = { {x, y} };
+    Ramsete_Follow_Path(single, 1, timeout_ms);
+}
+
+const int RAMSETE_MAX_WAYPOINTS = 10;
+const double RAMSETE_ACCEL_IN_PER_SEC2 = 30.0;
+
+void Ramsete_Follow_Path(RamsetePoint* waypoints, int numWaypoints, double timeout_ms = 8000) {
+    if (numWaypoints < 1 || numWaypoints > RAMSETE_MAX_WAYPOINTS) return;
+
+    RamsetePoint pts[RAMSETE_MAX_WAYPOINTS + 1];
+    pts[0] = { global_x, global_y };
+    for (int i = 0; i < numWaypoints; i++) pts[i + 1] = waypoints[i];
+    int numPts = numWaypoints + 1;
+
+    double cumDist[RAMSETE_MAX_WAYPOINTS + 1];
+    cumDist[0] = 0.0;
+    for (int i = 1; i < numPts; i++) {
+        double dx = pts[i].x - pts[i - 1].x;
+        double dy = pts[i].y - pts[i - 1].y;
+        cumDist[i] = cumDist[i - 1] + sqrt(dx * dx + dy * dy);
+    }
+    double total_dist = cumDist[numPts - 1];
+    if (total_dist < 0.01) return;
+
+    double a = RAMSETE_ACCEL_IN_PER_SEC2;
+    double cruiseV = RAMSETE_CRUISE_VEL_IN_PER_SEC;
+    double accel_dist = (cruiseV * cruiseV) / (2.0 * a);
+    double peakV = cruiseV;
+    double accel_time, cruise_time, decel_time;
+
+    if (2.0 * accel_dist > total_dist) {
+        peakV = sqrt(a * total_dist);
+        accel_time = peakV / a;
+        cruise_time = 0.0;
+        decel_time = accel_time;
+        accel_dist = total_dist / 2.0;
+    } else {
+        accel_time = cruiseV / a;
+        double cruise_dist = total_dist - 2.0 * accel_dist;
+        cruise_time = cruise_dist / cruiseV;
+        decel_time = accel_time;
+    }
+    double total_time_sec = accel_time + cruise_time + decel_time;
+
+    uint32_t start_ms = millis();
+    while (millis() - start_ms < timeout_ms) {
+        double t = (millis() - start_ms) / 1000.0;
+        double tc = clampd(t, 0.0, total_time_sec);
+
+        double s, v_d;
+        if (tc < accel_time) {
+            s = 0.5 * a * tc * tc;
+            v_d = a * tc;
+        } else if (tc < accel_time + cruise_time) {
+            double tt = tc - accel_time;
+            s = accel_dist + peakV * tt;
+            v_d = peakV;
+        } else {
+            double td = tc - accel_time - cruise_time;
+            s = (total_dist - accel_dist) + peakV * td - 0.5 * a * td * td;
+            v_d = peakV - a * td;
+        }
+        s = clampd(s, 0.0, total_dist);
+        if (t >= total_time_sec) v_d = 0.0;
+
+        int seg = 0;
+        while (seg < numPts - 2 && s > cumDist[seg + 1]) seg++;
+        double seg_len = cumDist[seg + 1] - cumDist[seg];
+        double seg_frac = (seg_len > 0.001) ? (s - cumDist[seg]) / seg_len : 1.0;
+
+        double seg_dx = pts[seg + 1].x - pts[seg].x;
+        double seg_dy = pts[seg + 1].y - pts[seg].y;
+        double x_d = pts[seg].x + seg_dx * seg_frac;
+        double y_d = pts[seg].y + seg_dy * seg_frac;
+        double path_heading_rad = atan2(seg_dx, seg_dy);
+        double omega_d = 0.0;
+
+        double theta = global_heading_rad;
+        double global_dx = x_d - global_x;
+        double global_dy = y_d - global_y;
+
+        double e_right = cos(theta) * global_dx + sin(theta) * global_dy;
+        double e_forward = -sin(theta) * global_dx + cos(theta) * global_dy;
+        double e_theta = normalize_deg((path_heading_rad - theta) * (180.0 / M_PI)) * (M_PI / 180.0);
+
+        double k = 2.0 * RAMSETE_ZETA * sqrt(omega_d * omega_d + RAMSETE_B * v_d * v_d);
+        double v = v_d * cos(e_theta) + k * e_forward;
+        double omega = omega_d + k * e_theta + RAMSETE_B * v_d * sinc(e_theta) * e_right;
+
+        double v_right = v + omega * (ROBOT_TRACK_WIDTH_IN / 2.0);
+        double v_left = v - omega * (ROBOT_TRACK_WIDTH_IN / 2.0);
+
+        double right_pct = clampd((v_right / MAX_VELOCITY_IN_PER_SEC) * 100.0, -100.0, 100.0);
+        double left_pct = clampd((v_left / MAX_VELOCITY_IN_PER_SEC) * 100.0, -100.0, 100.0);
+
+        setDriveRight(right_pct);
+        setDriveLeft(left_pct);
+
+        double dist_to_final = sqrt((pts[numPts - 1].x - global_x) * (pts[numPts - 1].x - global_x) +
+                                     (pts[numPts - 1].y - global_y) * (pts[numPts - 1].y - global_y));
+        if (t >= total_time_sec && dist_to_final < 1.5) break;
+        delay(10);
+    }
+    stopDrive();
+}
+
+RamsetePoint asyncPathBuffer[RAMSETE_MAX_WAYPOINTS];
+int asyncPathCount = 0;
+bool asyncPathRunning = false;
+
+void asyncPathTaskFn(void*) {
+    Ramsete_Follow_Path(asyncPathBuffer, asyncPathCount);
+    asyncPathRunning = false;
+}
+
+void Ramsete_Follow_Path_Async(RamsetePoint* waypoints, int numWaypoints) {
+    if (numWaypoints < 1 || numWaypoints > RAMSETE_MAX_WAYPOINTS) return;
+    if (asyncPathRunning) return;
+
+    for (int i = 0; i < numWaypoints; i++) asyncPathBuffer[i] = waypoints[i];
+    asyncPathCount = numWaypoints;
+    asyncPathRunning = true;
+
+    Task asyncPathTask(asyncPathTaskFn, (void*) nullptr);
+}
+
+bool Ramsete_Path_Is_Done(void) { return !asyncPathRunning; }
+
+void Ramsete_Wait_For_Path(void) {
+    while (asyncPathRunning) delay(10);
+}
+
+// ------------------------------------------------------------
+// Auton routes
+// ------------------------------------------------------------
+void auton_red_left(void) {
+    RS_Drive(DriveDir::REVERSE, 300, 40);
+    LS_Drive(DriveDir::REVERSE, 300, 40);
+    lift_set_target(190);
+    RamsetePoint SideA_Red_Left_1[] = { {-48, -24} };
+    Ramsete_Follow_Path(SideA_Red_Left_1, 1);
+    lift_set_target(0);
+    swing_to_heading(45, SWING_LEFT);
+    RamsetePoint SideA_Red_Left_2[] = { {-24, -24} };
+    Ramsete_Follow_Path(SideA_Red_Left_2, 1);
+    IntakeSpin(100, 2000);
+    lift_set_target(190);
+    RamsetePoint SideA_Red_Left_3[] = { {-48, -24} };
+    Ramsete_Follow_Path(SideA_Red_Left_3, 1);
+    lift_set_target(0);
+    swing_to_heading(45, SWING_LEFT, TURN_CW);
+    RamsetePoint SideA_Red_Left_4[] = { {-24, -48} };
+    Ramsete_Follow_Path(SideA_Red_Left_4, 1);
+    IntakeSpin(100, 2000);
+    RamsetePoint SideA_Red_Left_5[] = { {-48, -24} };
+    Ramsete_Follow_Path(SideA_Red_Left_5, 1);
+    lift_set_target(190);
+    RamsetePoint SideA_Red_Left_6[] = { {-24, -65} };
+    Ramsete_Follow_Path(SideA_Red_Left_6, 1);
+}
+
+void auton_red_bottom(void) {
+    RS_Drive(DriveDir::REVERSE, 300, 40);
+    LS_Drive(DriveDir::REVERSE, 300, 40);
+    lift_set_target(190);
+    RamsetePoint SideA_Red_Bottom_1[] = { {-24, -48} };
+    Ramsete_Follow_Path(SideA_Red_Bottom_1, 1);
+    lift_set_target(0);
+    swing_to_heading(45, SWING_LEFT);
+    RamsetePoint SideA_Red_Bottom_2[] = { {-24, -24} };
+    Ramsete_Follow_Path(SideA_Red_Bottom_2, 1);
+    IntakeSpin(100, 2000);
+    lift_set_target(190);
+    RamsetePoint SideA_Red_Bottom_3[] = { {-24, -48} };
+    Ramsete_Follow_Path(SideA_Red_Bottom_3, 1);
+    lift_set_target(0);
+    RamsetePoint SideA_Red_Bottom_4[] = { {-48, -48} };
+    Ramsete_Follow_Path(SideA_Red_Bottom_4, 1);
+    IntakeSpin(100, 2000);
+    RamsetePoint SideA_Red_Bottom_5[] = { {-24, -48} };
+    Ramsete_Follow_Path(SideA_Red_Bottom_5, 1);
+    lift_set_target(190);
+    RamsetePoint SideA_Red_Bottom_6[] = { {-24, -65} };
+    Ramsete_Follow_Path(SideA_Red_Bottom_6, 1);
+}
+
+void auton_blue_right(void) {
+    RS_Drive(DriveDir::REVERSE, 300, 40);
+    LS_Drive(DriveDir::REVERSE, 300, 40);
+    lift_set_target(190);
+    RamsetePoint SideA_Blue_Right_1[] = { {48, 24} };
+    Ramsete_Follow_Path(SideA_Blue_Right_1, 1);
+    lift_set_target(0);
+    swing_to_heading(45, SWING_LEFT);
+    RamsetePoint SideA_Blue_Right_2[] = { {24, 24} };
+    Ramsete_Follow_Path(SideA_Blue_Right_2, 1);
+    IntakeSpin(100, 2000);
+    lift_set_target(190);
+    RamsetePoint SideA_Blue_Right_3[] = { {48, 24} };
+    Ramsete_Follow_Path(SideA_Blue_Right_3, 1);
+    lift_set_target(0);
+    swing_to_heading(45, SWING_LEFT, TURN_CW);
+    RamsetePoint SideA_Blue_Right_4[] = { {24, 48} };
+    Ramsete_Follow_Path(SideA_Blue_Right_4, 1);
+    IntakeSpin(100, 2000);
+    RamsetePoint SideA_Blue_Right_5[] = { {48, 24} };
+    Ramsete_Follow_Path(SideA_Blue_Right_5, 1);
+    lift_set_target(190);
+    RamsetePoint SideA_Blue_Right_6[] = { {65, 48} };
+    Ramsete_Follow_Path(SideA_Blue_Right_6, 1);
+}
+
+void auton_blue_top(void) {
+    RS_Drive(DriveDir::REVERSE, 300, 40);
+    LS_Drive(DriveDir::REVERSE, 300, 40);
+    lift_set_target(190);
+    RamsetePoint SideA_Blue_Top_1[] = { {24, 48} };
+    Ramsete_Follow_Path(SideA_Blue_Top_1, 1);
+    lift_set_target(0);
+    swing_to_heading(45, SWING_LEFT);
+    RamsetePoint SideA_Blue_Top_2[] = { {24, 24} };
+    Ramsete_Follow_Path(SideA_Blue_Top_2, 1);
+    IntakeSpin(100, 2000);
+    lift_set_target(190);
+    RamsetePoint SideA_Blue_Top_3[] = { {24, 48} };
+    Ramsete_Follow_Path(SideA_Blue_Top_3, 1);
+    lift_set_target(0);
+    RamsetePoint SideA_Blue_Top_4[] = { {24, 24} };
+    Ramsete_Follow_Path(SideA_Blue_Top_4, 1);
+    IntakeSpin(100, 2000);
+    RamsetePoint SideA_Blue_Top_5[] = { {48, 24} };
+    Ramsete_Follow_Path(SideA_Blue_Top_5, 1);
+    lift_set_target(190);
+    RamsetePoint SideA_Blue_Top_6[] = { {65, 48} };
+    Ramsete_Follow_Path(SideA_Blue_Top_6, 1);
+}
+
+void auton_red_left_alt(void) {
+}
+
+void auton_red_bottom_alt(void) {
+    RS_Drive(DriveDir::REVERSE, 300, 40);
+    LS_Drive(DriveDir::REVERSE, 300, 40);
+    lift_set_target(190);
+    RamsetePoint SideB_Red_Bottom_1[] = { {-12, -24}, {-24, -48} };
+    Ramsete_Follow_Path(SideB_Red_Bottom_1, 2);
+    lift_set_target(0);
+    swing_to_heading(45, SWING_LEFT, TURN_CW);
+    Ramsete_Drive_To_Point(0, -24);
+    IntakeSpin(100, 2000);
+    lift_set_target(190);
+    swing_to_heading(90, SWING_LEFT, TURN_CW);
+    RamsetePoint SideB_Red_Bottom_3[] = { {24, -48} };
+    Ramsete_Follow_Path(SideB_Red_Bottom_3, 1);
+    lift_set_target(0);
+    swing_to_heading(45, SWING_LEFT, TURN_CCW);
+    Ramsete_Drive_To_Point(24, -24);
+    IntakeSpin(100, 2000);
+    RamsetePoint SideB_Red_Bottom_5[] = { {24, -48} };
+    Ramsete_Follow_Path(SideB_Red_Bottom_5, 1);
+    lift_set_target(190);
+    RamsetePoint SideB_Red_Bottom_6[] = { {-65, -48} };
+    Ramsete_Follow_Path(SideB_Red_Bottom_6, 1);
+}
+
+void auton_blue_right_alt(void) {
+    RS_Drive(DriveDir::REVERSE, 300, 40);
+    LS_Drive(DriveDir::REVERSE, 300, 40);
+    lift_set_target(190);
+    RamsetePoint SideB_Blue_Right_1[] = { {12, 24}, {24, 48} };
+    Ramsete_Follow_Path(SideB_Blue_Right_1, 2);
+    lift_set_target(0);
+    swing_to_heading(45, SWING_LEFT, TURN_CW);
+    Ramsete_Drive_To_Point(0, 24);
+    IntakeSpin(100, 2000);
+    lift_set_target(190);
+    swing_to_heading(90, SWING_LEFT, TURN_CW);
+    RamsetePoint SideB_Blue_Right_3[] = { {-24, 48} };
+    Ramsete_Follow_Path(SideB_Blue_Right_3, 1);
+    lift_set_target(0);
+    swing_to_heading(45, SWING_LEFT, TURN_CCW);
+    Ramsete_Drive_To_Point(-24, 24);
+    IntakeSpin(100, 2000);
+    RamsetePoint SideB_Blue_Right_5[] = { {-24, 48} };
+    Ramsete_Follow_Path(SideB_Blue_Right_5, 1);
+    lift_set_target(190);
+    RamsetePoint SideB_Blue_Right_6[] = { {65, 48} };
+    Ramsete_Follow_Path(SideB_Blue_Right_6, 1);
+}
+
+void auton_blue_top_alt(void) {
+}
+
+void auton_red_left_sideC(void) {}
+void auton_red_bottom_sideC(void) {}
+void auton_blue_right_sideC(void) {}
+void auton_blue_top_sideC(void) {}
+
+void autonomous(void) {
+    switch (startPos) {
+        case RED_LEFT:
+            if (autonStrategy == SIDEA)      auton_red_left();
+            else if (autonStrategy == SIDEB) auton_red_left_alt();
+            else                             auton_red_left_sideC();
+            break;
+        case RED_BOTTOM:
+            if (autonStrategy == SIDEA)      auton_red_bottom();
+            else if (autonStrategy == SIDEB) auton_red_bottom_alt();
+            else                             auton_red_bottom_sideC();
+            break;
+        case BLUE_RIGHT:
+            if (autonStrategy == SIDEA)      auton_blue_right();
+            else if (autonStrategy == SIDEB) auton_blue_right_alt();
+            else                             auton_blue_right_sideC();
+            break;
+        case BLUE_TOP:
+            if (autonStrategy == SIDEA)      auton_blue_top();
+            else if (autonStrategy == SIDEB) auton_blue_top_alt();
+            else                             auton_blue_top_sideC();
+            break;
+    }
+}
+
+const char* startPosLabel(StartPosition pos) {
+    switch (pos) {
+        case RED_LEFT:   return "RED LEFT";
+        case RED_BOTTOM: return "RED BOTTOM";
+        case BLUE_RIGHT: return "BLUE RIGHT";
+        case BLUE_TOP:   return "BLUE TOP";
+        default:         return "UNKNOWN";
+    }
+}
+
+const char* autonStrategyLabel(AutonStrategy strat) {
+    switch (strat) {
+        case SIDEA: return "SIDE A";
+        case SIDEB: return "SIDE B";
+        case SIDEC: return "SIDE C";
+        default:    return "UNKNOWN";
+    }
+}
+
+int applyDeadzone(int value, int deadzone) {
+    if (abs(value) < deadzone) return 0;
+    return value;
+}
+
+const int DRIVE_DEADZONE = 20;
+
+void run_auton_selector(void) {
+    // Keep this simple and portable in PROS.
+    // You can replace this with a touch-driven selector later if needed.
+    autonStrategy = SIDEA;
+    startPos = RED_LEFT;
+}
+
+void typeOutLine(int row, const char* text, int char_delay_ms = 40) {
+    char buffer[64];
+    int len = 0;
+    while (text[len] != '\0' && len < 63) len++;
+
+    for (int i = 0; i < len; i++) {
+        buffer[i] = text[i];
+        buffer[i + 1] = '\0';
+        lcd::clear_line(row);
+        lcd::print(row, "%s", buffer);
+        delay(char_delay_ms);
+    }
+}
+
+void pre_auton(void) {
+    run_auton_selector();
+    imu.reset();
+    while (imu.is_calibrating()) {
+        delay(20);
+    }
+
+    lcd::clear();
+
+    char sideLine[32];
+    std::snprintf(sideLine, sizeof(sideLine), "INSERT %s", autonStrategyLabel(autonStrategy));
+    typeOutLine(1, sideLine);
+
+    char posLine[32];
+    std::snprintf(posLine, sizeof(posLine), "INSERT %s", startPosLabel(startPos));
+    typeOutLine(2, posLine);
+}
+
+void opcontrol(void) {
+    while (true) {
+        int axis3Value = applyDeadzone(master.get_analog(ANALOG_LEFT_Y), DRIVE_DEADZONE);
+        int axis2Value = applyDeadzone(master.get_analog(ANALOG_RIGHT_Y), DRIVE_DEADZONE);
+
+        setDriveLeft(axis3Value);
+        setDriveRight(axis2Value);
+
+        static bool r1WasPressed = false;
+        static bool r2WasPressed = false;
+        bool r1Pressed = master.get_digital(DIGITAL_R1);
+        bool r2Pressed = master.get_digital(DIGITAL_R2);
+
+        if (r1Pressed && !r1WasPressed) {
+            switch (liftState) {
+                case LIFT_STATE_DOWN: liftState = LIFT_STATE_MID; lift_set_target(LIFT_MID_DEG); break;
+                case LIFT_STATE_MID:  liftState = LIFT_STATE_UP;  lift_set_target(LIFT_UP_DEG);  break;
+                case LIFT_STATE_UP:   liftState = LIFT_STATE_DOWN; lift_set_target(LIFT_DOWN_DEG); break;
+            }
+        }
+        if (r2Pressed && !r2WasPressed) {
+            liftState = LIFT_STATE_DOWN;
+            lift_set_target(LIFT_DOWN_DEG);
+        }
+        r1WasPressed = r1Pressed;
+        r2WasPressed = r2Pressed;
+
+        delay(20);
+    }
+}
+
+void initialize() {
+    pre_auton();
+    Task odomTask(odom_task_fn);
+    Task liftTask(lift_task_fn);
+}
+
+void disabled() {}
+void competition_initialize() {}
+
